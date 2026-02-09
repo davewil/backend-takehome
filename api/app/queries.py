@@ -84,3 +84,34 @@ async def validate_user_access(
         return False, "Lesson not found or does not belong to tenant"
 
     return True, ""
+    
+async def upsert_progress(
+    conn: asyncpg.Connection,
+    user_id: int,
+    lesson_id: int,
+    block_id: int,
+    status: str,
+) -> str:
+    query ="""
+        INSERT INTO user_block_progress (user_id, lesson_id, block_id, status, updated_at)
+        VALUES ($1, $2, $3, $4, now())
+        ON CONFLICT (user_id, lesson_id, block_id) DO UPDATE
+            SET status = CASE
+                    WHEN user_block_progress.status = 'completed' THEN 'completed'
+                    ELSE EXCLUDED.status
+                END,
+                updated_at = now()
+        RETURNING status
+        """
+    row = await conn.fetchrow(query, user_id, lesson_id, block_id, status)
+    return row["status"]
+
+async def validate_block_in_lesson(
+    conn: asyncpg.Connection, lesson_id: int, block_id: int
+) -> bool:
+    query = "SELECT 1 FROM lesson_blocks WHERE lesson_id = $1 AND block_id = $2"
+    row = await conn.fetchrow(query,
+        lesson_id,
+        block_id,
+    )
+    return row is not None

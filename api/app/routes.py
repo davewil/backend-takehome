@@ -9,13 +9,17 @@ from .models import (
     ProgressSummary,
     Variant,
     ErrorResponse,
-    ErrorDetail
+    ErrorDetail,
+    ProgressUpsertRequest,
+    ProgressUpsertResponse
 )
 from .queries import (
     get_lesson,
     get_assembled_blocks,
     get_progress_summary,
-    validate_user_access
+    validate_user_access,
+    upsert_progress,
+    validate_block_in_lesson
 )
 
 from fastapi import APIRouter, Request
@@ -74,4 +78,35 @@ async def get_lesson_content(tenant_id: int, user_id:int, lesson_id: int, reques
         ),
         blocks=blocks,
         progress_summary=build_progress_summary(progress_row)
+    )
+
+
+@router.put("/tenants/{tenant_id}/users/{user_id}/lessons/{lesson_id}/progress")
+async def put_progress(tenant_id: int, user_id: int, lesson_id: int, body: ProgressUpsertRequest, request: Request):
+    if body.status not in ("seen", "completed"):
+        return error_response(
+            400, "invalid_status", "Status must be 'seen' or 'completed'"
+        )
+
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        ok, msg = await validate_user_access(
+            conn, tenant_id, user_id, lesson_id
+        )
+        if not ok:
+            return error_response(404, "not_found", msg)
+
+        if not await validate_block_in_lesson(conn, lesson_id, body.block_id):
+            return error_response(
+                400, "invalid_block", "Block does not belong to this lesson"
+            )
+
+        stored_status = await upsert_progress(
+            conn, user_id, lesson_id, body.block_id, body.status
+        )
+        progress_row = await get_progress_summary(conn, user_id, lesson_id)
+
+    return ProgressUpsertResponse(
+        stored_status=stored_status,
+        progress_summary=build_progress_summary(progress_row),
     )

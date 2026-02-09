@@ -38,3 +38,12 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+class ProgressUpsertRequest(BaseModel):
+    block_id: int
+    status: str
+
+
+class ProgressUpsertResponse(BaseModel):
+    stored_status: str
+    progress_summary: ProgressSummary
