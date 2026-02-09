@@ -30,3 +30,11 @@ class LessonResponse(BaseModel):
     lesson: Lesson
     blocks: list[LessonBlock]
     progress_summary: ProgressSummary
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetail

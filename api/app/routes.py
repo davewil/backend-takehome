@@ -7,17 +7,26 @@ from .models import (
     LessonBlock,
     LessonResponse,
     ProgressSummary,
-    Variant
+    Variant,
+    ErrorResponse,
+    ErrorDetail
 )
 from .queries import (
     get_lesson,
     get_assembled_blocks,
-    get_progress_summary
+    get_progress_summary,
+    validate_user_access
 )
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
+
+
+def error_response(status_code: int, code: str, message: str) -> JSONResponse:
+    body = ErrorResponse(error=ErrorDetail(code=code, message=message))
+    return JSONResponse(status_code=status_code, content=body.model_dump())
 
 def build_progress_summary(row) -> ProgressSummary:
     total = row["total_blocks"]
@@ -34,6 +43,9 @@ def build_progress_summary(row) -> ProgressSummary:
 async def get_lesson_content(tenant_id: int, user_id:int, lesson_id: int, request: Request):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
+        ok, msg = await validate_user_access(conn, tenant_id, user_id, lesson_id)
+        if not ok:
+            return error_response(404, "not_found", msg)
 
         lesson_row = await get_lesson(conn, lesson_id)
         block_rows = await get_assembled_blocks(conn, lesson_id, tenant_id, user_id)

@@ -60,4 +60,27 @@ async def get_progress_summary(conn: asyncpg.Connection, user_id: int, lesson_id
         WHERE lb.lesson_id = $2
         """
     return await conn.fetchrow(query, user_id, lesson_id)
-    
+
+async def validate_user_access(
+    conn: asyncpg.Connection,
+    tenant_id: int,
+    user_id: int,
+    lesson_id: int,
+) -> tuple[bool, str]:
+    row = await conn.fetchrow("SELECT 1 FROM tenants WHERE id = $1", tenant_id)
+    if not row:
+        return False, "Tenant not found"
+
+    row = await conn.fetchrow(
+        "SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2", user_id, tenant_id
+    )
+    if not row:
+        return False, "User not found or does not belong to tenant"
+
+    row = await conn.fetchrow(
+        "SELECT 1 FROM lessons WHERE id = $1 AND tenant_id = $2", lesson_id, tenant_id
+    )
+    if not row:
+        return False, "Lesson not found or does not belong to tenant"
+
+    return True, ""
