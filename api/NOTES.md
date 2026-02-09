@@ -1,5 +1,7 @@
 # Notes
 
+to start run uv run uvicorn app.main:app --reload --port 8000 in api directory
+
 ## Trade-offs made
 - **Single assembled query with LATERAL JOIN** — slightly more complex SQL, but avoids N+1 queries and keeps variant selection in the database where it's most efficient.
 - **In-memory progress summary computation on GET** — since we already fetch all blocks with progress
