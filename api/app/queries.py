@@ -1,117 +1,192 @@
 from __future__ import annotations
-import asyncpg  
 
-async def get_lesson(conn: asyncpg.Connection, lesson_id: int) -> asyncpg.Record | None:
-    query = "SELECT id, slug, title FROM lessons WHERE id = $1"
-    return await conn.fetchrow(query, lesson_id)
-    
-async def get_assembled_blocks(conn: asyncpg.Connection, lesson_id: int, tenant_id: int, user_id: int) -> list[asyncpg.Record]:
-    query = """
-        SELECT
-            b.id            AS block_id,
-            b.block_type,
-            lb.position,
-            bv.id           AS variant_id,
-            bv.tenant_id    AS variant_tenant_id,
-            bv.data         AS variant_data,
-            ubp.status      AS user_progress
-        FROM lesson_blocks lb
-        JOIN blocks b ON b.id = lb.block_id
-        JOIN LATERAL (
-            SELECT bv2.id, bv2.tenant_id, bv2.data
-            FROM block_variants bv2
-            WHERE bv2.block_id = b.id
-              AND (bv2.tenant_id = $2 OR bv2.tenant_id IS NULL)
-            ORDER BY bv2.tenant_id NULLS LAST
-            LIMIT 1
-        ) bv ON true
-        LEFT JOIN user_block_progress ubp
-            ON ubp.user_id = $3
-           AND ubp.lesson_id = $1
-           AND ubp.block_id = b.id
-        WHERE lb.lesson_id = $1
-        ORDER BY lb.position
-        """
-    return await conn.fetch(query, lesson_id, tenant_id, user_id)
-    
-async def get_progress_summary(conn: asyncpg.Connection, user_id: int, lesson_id: int) -> asyncpg.Record:
-    query ="""
-        SELECT
-            (SELECT count(*) FROM lesson_blocks WHERE lesson_id = $2)::int
-                AS total_blocks,
-            count(*) FILTER (WHERE ubp.status IN ('seen', 'completed'))::int
-                AS seen_blocks,
-            count(*) FILTER (WHERE ubp.status = 'completed')::int
-                AS completed_blocks,
-            (
-                SELECT ubp2.block_id
-                FROM user_block_progress ubp2
-                JOIN lesson_blocks lb2
-                    ON lb2.lesson_id = $2 AND lb2.block_id = ubp2.block_id
-                WHERE ubp2.user_id = $1 AND ubp2.lesson_id = $2
-                ORDER BY lb2.position DESC
-                LIMIT 1
-            ) AS last_seen_block_id
-        FROM lesson_blocks lb
-        LEFT JOIN user_block_progress ubp
-            ON ubp.user_id = $1
-           AND ubp.lesson_id = $2
-           AND ubp.block_id = lb.block_id
-        WHERE lb.lesson_id = $2
-        """
-    return await conn.fetchrow(query, user_id, lesson_id)
+from sqlalchemy import Integer, case, func, literal_column, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .db_models import (
+    Block,
+    BlockVariant,
+    Lesson,
+    LessonBlock,
+    Tenant,
+    User,
+    UserBlockProgress,
+)
+
+
+async def get_lesson(session: AsyncSession, lesson_id: int):
+    result = await session.get(Lesson, lesson_id)
+    return result
+
+
+async def get_assembled_blocks(
+    session: AsyncSession, lesson_id: int, tenant_id: int, user_id: int
+) -> list:
+    # LATERAL subquery for best variant per block
+    variant_subq = (
+        select(
+            BlockVariant.id,
+            BlockVariant.tenant_id,
+            BlockVariant.data,
+        )
+        .where(
+            BlockVariant.block_id == Block.id,
+            (BlockVariant.tenant_id == tenant_id) | (BlockVariant.tenant_id.is_(None)),
+        )
+        .order_by(BlockVariant.tenant_id.nulls_last())
+        .limit(1)
+        .lateral("bv")
+    )
+
+    stmt = (
+        select(
+            Block.id.label("block_id"),
+            Block.block_type,
+            LessonBlock.position,
+            variant_subq.c.id.label("variant_id"),
+            variant_subq.c.tenant_id.label("variant_tenant_id"),
+            variant_subq.c.data.label("variant_data"),
+            UserBlockProgress.status.label("user_progress"),
+        )
+        .select_from(LessonBlock)
+        .join(Block, Block.id == LessonBlock.block_id)
+        .join(variant_subq, literal_column("true"))
+        .outerjoin(
+            UserBlockProgress,
+            (UserBlockProgress.user_id == user_id)
+            & (UserBlockProgress.lesson_id == lesson_id)
+            & (UserBlockProgress.block_id == Block.id),
+        )
+        .where(LessonBlock.lesson_id == lesson_id)
+        .order_by(LessonBlock.position)
+    )
+
+    result = await session.execute(stmt)
+    return result.all()
+
+
+async def get_progress_summary(
+    session: AsyncSession, user_id: int, lesson_id: int
+):
+    total_subq = (
+        select(func.count())
+        .select_from(LessonBlock)
+        .where(LessonBlock.lesson_id == lesson_id)
+        .correlate()
+        .scalar_subquery()
+    )
+
+    last_seen_subq = (
+        select(UserBlockProgress.block_id)
+        .join(
+            LessonBlock,
+            (LessonBlock.lesson_id == lesson_id)
+            & (LessonBlock.block_id == UserBlockProgress.block_id),
+        )
+        .where(
+            UserBlockProgress.user_id == user_id,
+            UserBlockProgress.lesson_id == lesson_id,
+        )
+        .order_by(LessonBlock.position.desc())
+        .limit(1)
+        .correlate()
+        .scalar_subquery()
+    )
+
+    stmt = (
+        select(
+            total_subq.cast(Integer).label("total_blocks"),
+            func.count()
+            .filter(UserBlockProgress.status.in_(["seen", "completed"]))
+            .cast(Integer)
+            .label("seen_blocks"),
+            func.count()
+            .filter(UserBlockProgress.status == "completed")
+            .cast(Integer)
+            .label("completed_blocks"),
+            last_seen_subq.label("last_seen_block_id"),
+        )
+        .select_from(LessonBlock)
+        .outerjoin(
+            UserBlockProgress,
+            (UserBlockProgress.user_id == user_id)
+            & (UserBlockProgress.lesson_id == lesson_id)
+            & (UserBlockProgress.block_id == LessonBlock.block_id),
+        )
+        .where(LessonBlock.lesson_id == lesson_id)
+    )
+
+    result = await session.execute(stmt)
+    return result.one()
+
 
 async def validate_user_access(
-    conn: asyncpg.Connection,
+    session: AsyncSession,
     tenant_id: int,
     user_id: int,
     lesson_id: int,
 ) -> tuple[bool, str]:
-    row = await conn.fetchrow("SELECT 1 FROM tenants WHERE id = $1", tenant_id)
+    row = (await session.execute(
+        select(Tenant.id).where(Tenant.id == tenant_id)
+    )).first()
     if not row:
         return False, "Tenant not found"
 
-    row = await conn.fetchrow(
-        "SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2", user_id, tenant_id
-    )
+    row = (await session.execute(
+        select(User.id).where(User.id == user_id, User.tenant_id == tenant_id)
+    )).first()
     if not row:
         return False, "User not found or does not belong to tenant"
 
-    row = await conn.fetchrow(
-        "SELECT 1 FROM lessons WHERE id = $1 AND tenant_id = $2", lesson_id, tenant_id
-    )
+    row = (await session.execute(
+        select(Lesson.id).where(Lesson.id == lesson_id, Lesson.tenant_id == tenant_id)
+    )).first()
     if not row:
         return False, "Lesson not found or does not belong to tenant"
 
     return True, ""
-    
+
+
 async def upsert_progress(
-    conn: asyncpg.Connection,
+    session: AsyncSession,
     user_id: int,
     lesson_id: int,
     block_id: int,
     status: str,
 ) -> str:
-    query ="""
-        INSERT INTO user_block_progress (user_id, lesson_id, block_id, status, updated_at)
-        VALUES ($1, $2, $3, $4, now())
-        ON CONFLICT (user_id, lesson_id, block_id) DO UPDATE
-            SET status = CASE
-                    WHEN user_block_progress.status = 'completed' THEN 'completed'
-                    ELSE EXCLUDED.status
-                END,
-                updated_at = now()
-        RETURNING status
-        """
-    row = await conn.fetchrow(query, user_id, lesson_id, block_id, status)
-    return row["status"]
+    stmt = (
+        pg_insert(UserBlockProgress)
+        .values(
+            user_id=user_id,
+            lesson_id=lesson_id,
+            block_id=block_id,
+            status=status,
+            updated_at=func.now(),
+        )
+        .on_conflict_do_update(
+            index_elements=["user_id", "lesson_id", "block_id"],
+            set_={
+                "status": case(
+                    (UserBlockProgress.status == "completed", "completed"),
+                    else_=text("EXCLUDED.status"),
+                ),
+                "updated_at": func.now(),
+            },
+        )
+        .returning(UserBlockProgress.status)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one()
+
 
 async def validate_block_in_lesson(
-    conn: asyncpg.Connection, lesson_id: int, block_id: int
+    session: AsyncSession, lesson_id: int, block_id: int
 ) -> bool:
-    query = "SELECT 1 FROM lesson_blocks WHERE lesson_id = $1 AND block_id = $2"
-    row = await conn.fetchrow(query,
-        lesson_id,
-        block_id,
-    )
+    row = (await session.execute(
+        select(LessonBlock.block_id).where(
+            LessonBlock.lesson_id == lesson_id,
+            LessonBlock.block_id == block_id,
+        )
+    )).first()
     return row is not None

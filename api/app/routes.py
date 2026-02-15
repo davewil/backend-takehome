@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
-    Lesson, 
+    Lesson as LessonSchema,
     LessonBlock,
     LessonResponse,
     ProgressSummary,
@@ -11,7 +11,7 @@ from .models import (
     ErrorResponse,
     ErrorDetail,
     ProgressUpsertRequest,
-    ProgressUpsertResponse
+    ProgressUpsertResponse,
 )
 from .queries import (
     get_lesson,
@@ -19,10 +19,11 @@ from .queries import (
     get_progress_summary,
     validate_user_access,
     upsert_progress,
-    validate_block_in_lesson
+    validate_block_in_lesson,
 )
+from .database import get_session
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
@@ -32,79 +33,86 @@ def error_response(status_code: int, code: str, message: str) -> JSONResponse:
     body = ErrorResponse(error=ErrorDetail(code=code, message=message))
     return JSONResponse(status_code=status_code, content=body.model_dump())
 
+
 def build_progress_summary(row) -> ProgressSummary:
-    total = row["total_blocks"]
-    completed = row["completed_blocks"]
+    total = row.total_blocks
+    completed = row.completed_blocks
     return ProgressSummary(
         total_blocks=total,
-        seen_blocks=row["seen_blocks"],
+        seen_blocks=row.seen_blocks,
         completed_blocks=completed,
-        last_seen_block_id=row["last_seen_block_id"],
+        last_seen_block_id=row.last_seen_block_id,
         completed=total > 0 and completed == total,
     )
 
-@router.get("/tenants/{tenant_id}/users/{user_id}/lessons/{lesson_id}")
-async def get_lesson_content(tenant_id: int, user_id:int, lesson_id: int, request: Request):
-    pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        ok, msg = await validate_user_access(conn, tenant_id, user_id, lesson_id)
-        if not ok:
-            return error_response(404, "not_found", msg)
 
-        lesson_row = await get_lesson(conn, lesson_id)
-        block_rows = await get_assembled_blocks(conn, lesson_id, tenant_id, user_id)
-        progress_row = await get_progress_summary(conn, lesson_id, user_id)
-        
+@router.get("/tenants/{tenant_id}/users/{user_id}/lessons/{lesson_id}")
+async def get_lesson_content(
+    tenant_id: int,
+    user_id: int,
+    lesson_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    ok, msg = await validate_user_access(session, tenant_id, user_id, lesson_id)
+    if not ok:
+        return error_response(404, "not_found", msg)
+
+    lesson_row = await get_lesson(session, lesson_id)
+    block_rows = await get_assembled_blocks(session, lesson_id, tenant_id, user_id)
+    progress_row = await get_progress_summary(session, user_id, lesson_id)
+
     blocks = [
         LessonBlock(
-            id=r["block_id"],
-            type=r["block_type"],
-            position=r["position"],
+            id=r.block_id,
+            type=r.block_type,
+            position=r.position,
             variant=Variant(
-                id=r["variant_id"],
-                tenant_id=r["variant_tenant_id"],
-                data=json.loads(r["variant_data"])
+                id=r.variant_id,
+                tenant_id=r.variant_tenant_id,
+                data=r.variant_data,
             ),
-            user_progress=r["user_progress"]
+            user_progress=r.user_progress,
         )
         for r in block_rows
     ]
 
     return LessonResponse(
-        lesson=Lesson(
-            id=lesson_row["id"],
-            slug=lesson_row["slug"],
-            title=lesson_row["title"]
+        lesson=LessonSchema(
+            id=lesson_row.id,
+            slug=lesson_row.slug,
+            title=lesson_row.title,
         ),
         blocks=blocks,
-        progress_summary=build_progress_summary(progress_row)
+        progress_summary=build_progress_summary(progress_row),
     )
 
 
 @router.put("/tenants/{tenant_id}/users/{user_id}/lessons/{lesson_id}/progress")
-async def put_progress(tenant_id: int, user_id: int, lesson_id: int, body: ProgressUpsertRequest, request: Request):
+async def put_progress(
+    tenant_id: int,
+    user_id: int,
+    lesson_id: int,
+    body: ProgressUpsertRequest,
+    session: AsyncSession = Depends(get_session),
+):
     if body.status not in ("seen", "completed"):
         return error_response(
             400, "invalid_status", "Status must be 'seen' or 'completed'"
         )
 
-    pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        ok, msg = await validate_user_access(
-            conn, tenant_id, user_id, lesson_id
-        )
-        if not ok:
-            return error_response(404, "not_found", msg)
+    ok, msg = await validate_user_access(session, tenant_id, user_id, lesson_id)
+    if not ok:
+        return error_response(404, "not_found", msg)
 
-        if not await validate_block_in_lesson(conn, lesson_id, body.block_id):
-            return error_response(
-                400, "invalid_block", "Block does not belong to this lesson"
-            )
-
-        stored_status = await upsert_progress(
-            conn, user_id, lesson_id, body.block_id, body.status
+    if not await validate_block_in_lesson(session, lesson_id, body.block_id):
+        return error_response(
+            400, "invalid_block", "Block does not belong to this lesson"
         )
-        progress_row = await get_progress_summary(conn, user_id, lesson_id)
+
+    stored_status = await upsert_progress(
+        session, user_id, lesson_id, body.block_id, body.status
+    )
+    progress_row = await get_progress_summary(session, user_id, lesson_id)
 
     return ProgressUpsertResponse(
         stored_status=stored_status,
